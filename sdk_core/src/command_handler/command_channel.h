@@ -122,6 +122,7 @@ class CommandChannel : public IOLoop::IOLoopDelegate {
   std::string remote_ip_;
   TimePoint heartbeat_time_;
   TimePoint last_heartbeat_;
+  uint8_t last_work_state_ = 0;  /**< Last known work state from heartbeat */
   using SharedProtecotr = std::shared_ptr<Protector>;
   using WeakProtector = std::weak_ptr<Protector>;
   SharedProtecotr protector_ = std::make_shared<Protector>();

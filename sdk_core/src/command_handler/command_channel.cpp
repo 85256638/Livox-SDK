@@ -146,7 +146,12 @@ void CommandChannel::OnTimer(TimePoint now) {
     }
   }
 
-  if (now - last_heartbeat_ > std::chrono::seconds(3)) {
+  auto heartbeat_timeout = std::chrono::seconds(3);
+  if (last_work_state_ == 2 || last_work_state_ == 3) {
+    /** Power-saving(2) or Standby(3): use longer timeout to keep session alive */
+    heartbeat_timeout = std::chrono::seconds(15);
+  }
+  if (now - last_heartbeat_ > heartbeat_timeout) {
     DeviceDisconnect(handle_);
   } else {
     HeartBeat(now);
@@ -231,8 +236,11 @@ Command CommandChannel::DeepCopy(const Command &cmd) {
   return result_cmd;
 }
 
-void CommandChannel::OnHeartbeatAck(const CommPacket &) {
+void CommandChannel::OnHeartbeatAck(const CommPacket &packet) {
   last_heartbeat_ = steady_clock::now();
+  if (packet.data != NULL && packet.data_len >= sizeof(HeartbeatResponse)) {
+    last_work_state_ = reinterpret_cast<HeartbeatResponse *>(packet.data)->state;
+  }
 }
 
 void CommandChannel::DeviceDisconnect(uint8_t handle) {
