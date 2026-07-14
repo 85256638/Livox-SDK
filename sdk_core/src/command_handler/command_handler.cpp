@@ -109,6 +109,7 @@ bool CommandHandler::Init(std::weak_ptr<IOLoop> loop) {
 
 void CommandHandler::Uninit() {
   if (impl_) {
+    impl_->Uninit();
     impl_.reset(NULL);
   }
 }

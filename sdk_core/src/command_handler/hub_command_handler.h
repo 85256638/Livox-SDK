@@ -26,6 +26,7 @@
 #define LIVOX_HUB_COMMAND_HANDLER_H_
 
 #include <memory>
+#include <mutex>
 #include "command_handler.h"
 
 namespace livox {
@@ -42,6 +43,7 @@ class HubCommandHandlerImpl : public CommandHandlerImpl {
   std::weak_ptr<IOLoop> loop_;
   bool is_valid_;
   DeviceInfo hub_info_;
+  std::mutex channel_mutex_;
   std::unique_ptr<CommandChannel> channel_;
 };
 }  // namespace livox

@@ -29,48 +29,68 @@ using std::list;
 namespace livox {
 
 void LidarCommandHandlerImpl::Uninit() {
-  devices_.clear();
+  list<DeviceItem> devices;
+  {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    devices.swap(devices_);
+  }
+  for (list<DeviceItem>::iterator ite = devices.begin();
+       ite != devices.end(); ++ite) {
+    if (ite->channel) {
+      ite->channel->Uninit();
+    }
+  }
 }
 
 bool LidarCommandHandlerImpl::AddDevice(const DeviceInfo &info) {
   std::shared_ptr<CommandChannel> channel =
       std::make_shared<CommandChannel>(info.cmd_port, info.handle, info.ip, this);
-  channel->Bind(loop_);
+  if (!channel->Bind(loop_)) {
+    return false;
+  }
 
   DeviceItem item = {channel, info};
+  std::lock_guard<std::mutex> lock(devices_mutex_);
   devices_.push_back(item);
   return true;
 }
 
 livox_status LidarCommandHandlerImpl::SendCommand(uint8_t handle, const Command &command) {
-  CommandChannel *channel = NULL;
-  bool found = false;
-  for (list<DeviceItem>::iterator ite = devices_.begin(); ite != devices_.end(); ++ite) {
-    if (ite->info.handle == handle) {
-      found = true;
-      channel = ite->channel.get();
-      break;
+  std::shared_ptr<CommandChannel> channel;
+  {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    for (list<DeviceItem>::iterator ite = devices_.begin();
+         ite != devices_.end(); ++ite) {
+      if (ite->info.handle == handle) {
+        channel = ite->channel;
+        break;
+      }
     }
   }
-  if (!found) {
+  if (!channel) {
     return kStatusInvalidHandle;
   }
-  if (!channel) {
-    return kStatusChannelNotExist;
-  }
-  channel->SendAsync(command);
-
-  return kStatusSuccess;
+  return channel->SendAsync(command) ? kStatusSuccess
+                                     : kStatusChannelNotExist;
 }
 
 bool LidarCommandHandlerImpl::RemoveDevice(uint8_t handle) {
   bool found = false;
-  for (list<DeviceItem>::iterator ite = devices_.begin(); ite != devices_.end(); ++ite) {
-    if (ite->info.handle == handle) {
-      found = true;
-      devices_.erase(ite);
-      break;
+  std::shared_ptr<CommandChannel> channel;
+  {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    for (list<DeviceItem>::iterator ite = devices_.begin();
+         ite != devices_.end(); ++ite) {
+      if (ite->info.handle == handle) {
+        found = true;
+        channel = ite->channel;
+        devices_.erase(ite);
+        break;
+      }
     }
+  }
+  if (channel) {
+    channel->Uninit();
   }
 
   return found;

@@ -28,36 +28,52 @@
 namespace livox {
 
 void HubCommandHandlerImpl::Uninit() {
-  if (channel_) {
-    channel_.reset(NULL);
+  std::unique_ptr<CommandChannel> channel;
+  {
+    std::lock_guard<std::mutex> lock(channel_mutex_);
+    channel = std::move(channel_);
+    is_valid_ = false;
   }
-  is_valid_ = false;
+  if (channel) {
+    channel->Uninit();
+  }
 }
 
 bool HubCommandHandlerImpl::AddDevice(const DeviceInfo &info) {
+  std::unique_ptr<CommandChannel> channel(
+      new CommandChannel(info.cmd_port, info.handle, info.ip, this));
+  if (!channel->Bind(loop_)) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(channel_mutex_);
   if (is_valid_) {
     return false;
   }
   is_valid_ = true;
   hub_info_ = info;
-
-  channel_.reset(new CommandChannel(info.cmd_port, info.handle, info.ip, this));
-  channel_->Bind(loop_);
+  channel_ = std::move(channel);
   return true;
 }
 
 livox_status HubCommandHandlerImpl::SendCommand(uint8_t, const Command &command) {
+  std::lock_guard<std::mutex> lock(channel_mutex_);
   if (channel_ == NULL) {
     return kStatusChannelNotExist;
   }
-  channel_->SendAsync(command);
-  return kStatusSuccess;
+  return channel_->SendAsync(command) ? kStatusSuccess
+                                      : kStatusChannelNotExist;
 }
 
 bool HubCommandHandlerImpl::RemoveDevice(uint8_t) {
-  is_valid_ = false;
-  if (channel_) {
-    channel_.reset(NULL);
+  std::unique_ptr<CommandChannel> channel;
+  {
+    std::lock_guard<std::mutex> lock(channel_mutex_);
+    is_valid_ = false;
+    channel = std::move(channel_);
+  }
+  if (channel) {
+    channel->Uninit();
   }
   return false;
 }

@@ -24,10 +24,13 @@
 
 #ifndef LIVOX_COMMAND_CHANNEL_H_
 #define LIVOX_COMMAND_CHANNEL_H_
+#include <atomic>
 #include <memory>
 #include <map>
 #include <list>
+#include <mutex>
 #include <string>
+#include <vector>
 #include <algorithm>
 #include "base/io_loop.h"
 #include "comm/comm_port.h"
@@ -38,8 +41,10 @@ typedef struct TagCommand {
   uint8_t handle;
   CommPacket packet;
   std::shared_ptr<CommandCallback> cb;
+  std::shared_ptr<std::atomic<bool> > completion;
+  std::shared_ptr<std::vector<uint8_t> > owned_data;
   uint32_t time_out;
-  TagCommand() : packet(), time_out(0) {}
+  TagCommand() : handle(0), packet(), time_out(0) {}
   TagCommand(uint8_t _handle,
              uint8_t _cmd_type,
              uint8_t _cmd_set,
@@ -49,7 +54,10 @@ typedef struct TagCommand {
              uint16_t length,
              uint32_t _time_out,
              const std::shared_ptr<CommandCallback> &_cb)
-      : handle(_handle), packet(), cb(_cb) {
+      : handle(_handle),
+        packet(),
+        cb(_cb),
+        completion(std::make_shared<std::atomic<bool> >(false)) {
     packet.packet_type = _cmd_type;
     packet.cmd_set = _cmd_set;
     packet.cmd_code = _cmd_code;
@@ -95,7 +103,7 @@ class CommandChannel : public IOLoop::IOLoopDelegate {
    * Send a command asynchronously.
    * @param command the command to send.
    */
-  void SendAsync(const Command &command);
+  bool SendAsync(const Command &command);
 
   void OnData(socket_t, void *);
   void OnTimer(TimePoint now);
@@ -105,9 +113,17 @@ class CommandChannel : public IOLoop::IOLoopDelegate {
  private:
   void Send(const Command &cmd);
   void HeartBeat(TimePoint t);
-  void SendInternal(const Command &command);
+  bool SendInternal(const Command &command);
   Command DeepCopy(const Command &cmd);
-  void OnHeartbeatAck(const CommPacket &packet);
+  void OnHeartbeatAck(const HeartbeatResponse &response);
+  void UpdateModeTransition(const Command &command, TimePoint now);
+  void ForgetAcceptedCommand(const Command &command);
+  bool IsAcceptedCommand(const Command &command);
+  void CompleteCommand(const Command &command, livox_status status,
+                       void *data = NULL);
+  static bool ClaimCommandCompletion(const Command &command);
+  static void CompleteCommandOnce(const Command &command,
+                                  livox_status status, void *data = NULL);
   void DeviceDisconnect(uint8_t handle);
 
  private:
@@ -122,7 +138,12 @@ class CommandChannel : public IOLoop::IOLoopDelegate {
   std::string remote_ip_;
   TimePoint heartbeat_time_;
   TimePoint last_heartbeat_;
-  uint8_t last_work_state_ = 0;  /**< Last known work state from heartbeat */
+  TimePoint mode_transition_deadline_;
+  LidarState mode_transition_target_ = kLidarStateUnknown;
+  uint8_t last_work_state_ = kLidarStateUnknown;
+  std::mutex accepted_commands_mutex_;
+  std::map<uint16_t, Command> accepted_commands_;
+  bool accepting_commands_ = false;
   using SharedProtecotr = std::shared_ptr<Protector>;
   using WeakProtector = std::weak_ptr<Protector>;
   SharedProtecotr protector_ = std::make_shared<Protector>();

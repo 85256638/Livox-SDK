@@ -23,6 +23,7 @@
 //
 
 #include "command_channel.h"
+#include <cstring>
 #include <functional>
 #include <atomic>
 #include "base/logging.h"
@@ -68,6 +69,10 @@ bool CommandChannel::Bind(std::weak_ptr<IOLoop> loop) {
 
   loop_.lock()->AddDelegate(sock_, this);
   last_heartbeat_ = steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(accepted_commands_mutex_);
+    accepting_commands_ = true;
+  }
   return true;
 }
 
@@ -88,18 +93,43 @@ void CommandChannel::OnData(socket_t , void *) {
   while ((kParseSuccess == comm_port_->ParseCommStream(&packet))) {
     if (packet.packet_type == kCommandTypeAck) {
       uint16_t seq = packet.seq_num;
-      if (commands_.find(seq) != commands_.end()) {
-        Command command = commands_[seq].first;
+      map<uint16_t, pair<Command, TimePoint> >::iterator command_it =
+          commands_.find(seq);
+      const bool command_identity_matches =
+          command_it != commands_.end() &&
+          command_it->second.first.packet.cmd_set == packet.cmd_set &&
+          command_it->second.first.packet.cmd_code == packet.cmd_code;
+      if (command_identity_matches) {
+        Command command = command_it->second.first;
         command.packet = packet;
-        if (callback_) {
-          callback_->OnCommand(handle_, command);
+        commands_.erase(command_it);
+        ForgetAcceptedCommand(command);
+        if (ClaimCommandCompletion(command)) {
+          if (callback_) {
+            callback_->OnCommand(handle_, command);
+          } else if (command.cb) {
+            (*command.cb)(kStatusSuccess, handle_, command.packet.data);
+          }
         }
-        commands_.erase(seq);
       } else if (packet.cmd_set == kCommandSetGeneral && packet.cmd_code == kCommandIDGeneralHeartbeat) {
-        OnHeartbeatAck(packet);
-        if (callback_) {
-          callback_->OnHeartbeatStateUpdate(handle_, *(reinterpret_cast<HeartbeatResponse *>(packet.data)));
+        if (packet.data == NULL ||
+            packet.data_len < sizeof(HeartbeatResponse)) {
+          LOG_WARN("Ignore malformed heartbeat ACK: payload length {}",
+                   packet.data_len);
+          continue;
         }
+        HeartbeatResponse heartbeat;
+        std::memcpy(&heartbeat, packet.data, sizeof(heartbeat));
+        OnHeartbeatAck(heartbeat);
+        if (callback_) {
+          callback_->OnHeartbeatStateUpdate(handle_, heartbeat);
+        }
+      } else if (command_it != commands_.end()) {
+        LOG_WARN("Ignore mismatched ACK: seq {}, expected set/id {}/{}, got "
+                 "{}/{}",
+                 seq, command_it->second.first.packet.cmd_set,
+                 command_it->second.first.packet.cmd_code, packet.cmd_set,
+                 packet.cmd_code);
       }
     } else if (packet.packet_type == kCommandTypeMsg) {
       if (callback_) {
@@ -111,17 +141,33 @@ void CommandChannel::OnData(socket_t , void *) {
   }
 }
 
-void CommandChannel::SendAsync(const Command &command) {
-  Command cmd = DeepCopy(command);
-  if (!loop_.expired()) {
-    auto w_ptr = WeakProtector(protector_);
-    loop_.lock()->PostTask([this, w_ptr, cmd](){
-      if(w_ptr.expired()) {
-        return;
-      }
-      Send(cmd);
-    });
+bool CommandChannel::SendAsync(const Command &command) {
+  std::shared_ptr<IOLoop> loop = loop_.lock();
+  if (!loop) {
+    return false;
   }
+
+  Command cmd = DeepCopy(command);
+  WeakProtector w_ptr;
+  {
+    std::lock_guard<std::mutex> lock(accepted_commands_mutex_);
+    if (!accepting_commands_ ||
+        accepted_commands_.find(cmd.packet.seq_num) !=
+            accepted_commands_.end()) {
+      return false;
+    }
+    accepted_commands_[cmd.packet.seq_num] = cmd;
+    w_ptr = WeakProtector(protector_);
+  }
+
+  loop->PostTask([this, w_ptr, cmd]() {
+    if (w_ptr.expired()) {
+      CommandChannel::CompleteCommandOnce(cmd, kStatusNotConnected);
+      return;
+    }
+    Send(cmd);
+  });
+  return true;
 }
 
 void CommandChannel::OnTimer(TimePoint now) {
@@ -140,18 +186,27 @@ void CommandChannel::OnTimer(TimePoint now) {
   for (list<Command>::iterator ite = timeout_commands.begin(); ite != timeout_commands.end(); ++ite) {
     LOG_WARN("Command Timeout: Set {}, Id {}, Seq {}", 
         (uint16_t)ite->packet.cmd_set, ite->packet.cmd_code, ite->packet.seq_num);
-    if (callback_) {
+    ForgetAcceptedCommand(*ite);
+    if (ClaimCommandCompletion(*ite)) {
       ite->packet.packet_type = kCommandTypeAck;
-      callback_->OnCommand(handle_, *ite);
+      if (callback_) {
+        callback_->OnCommand(handle_, *ite);
+      } else if (ite->cb) {
+        (*ite->cb)(kStatusTimeout, handle_, NULL);
+      }
     }
   }
 
   auto heartbeat_timeout = std::chrono::seconds(3);
-  if (last_work_state_ == 2 || last_work_state_ == 3) {
+  if (last_work_state_ == kLidarStatePowerSaving ||
+      last_work_state_ == kLidarStateStandBy) {
     /** Power-saving(2) or Standby(3): use longer timeout to keep session alive */
     heartbeat_timeout = std::chrono::seconds(15);
   }
-  if (now - last_heartbeat_ > heartbeat_timeout) {
+  const bool mode_transition_active =
+      mode_transition_deadline_ != TimePoint() &&
+      now < mode_transition_deadline_;
+  if (!mode_transition_active && now - last_heartbeat_ > heartbeat_timeout) {
     DeviceDisconnect(handle_);
   } else {
     HeartBeat(now);
@@ -159,6 +214,20 @@ void CommandChannel::OnTimer(TimePoint now) {
 }
 
 void CommandChannel::Uninit() {
+  list<Command> canceled_commands;
+  {
+    std::lock_guard<std::mutex> lock(accepted_commands_mutex_);
+    accepting_commands_ = false;
+    protector_.reset();
+    for (map<uint16_t, Command>::const_iterator ite =
+             accepted_commands_.begin();
+         ite != accepted_commands_.end(); ++ite) {
+      canceled_commands.push_back(ite->second);
+    }
+    accepted_commands_.clear();
+  }
+  commands_.clear();
+
   if (sock_ != -1) {
     if (!loop_.expired()) {
       loop_.lock()->RemoveDelegate(sock_, this);
@@ -171,10 +240,18 @@ void CommandChannel::Uninit() {
     comm_port_.reset(NULL);
   }
 
-  commands_.clear();
   last_heartbeat_ = {};
   heartbeat_time_ = {};
+  mode_transition_deadline_ = {};
+  mode_transition_target_ = kLidarStateUnknown;
+  last_work_state_ = kLidarStateUnknown;
   remote_ip_ = "";
+
+  /** Invoke user code only after all channel containers are detached. */
+  for (list<Command>::const_iterator ite = canceled_commands.begin();
+       ite != canceled_commands.end(); ++ite) {
+    CompleteCommandOnce(*ite, kStatusNotConnected);
+  }
 }
 
 void CommandChannel::HeartBeat(TimePoint t) {
@@ -194,10 +271,14 @@ void CommandChannel::HeartBeat(TimePoint t) {
   }
 }
 
-void CommandChannel::SendInternal(const Command &command) {
+bool CommandChannel::SendInternal(const Command &command) {
   std::vector<uint8_t> buf(kMaxCommandBufferSize + 1);
-  int size = 0;
-  comm_port_->Pack(buf.data(), kMaxCommandBufferSize, (uint32_t *)&size, command.packet);
+  uint32_t size = 0;
+  if (comm_port_->Pack(buf.data(), kMaxCommandBufferSize, &size,
+                       command.packet) != 0 ||
+      size == 0) {
+    return false;
+  }
 
   struct sockaddr_in servaddr;
   servaddr.sin_family = AF_INET;
@@ -206,11 +287,10 @@ void CommandChannel::SendInternal(const Command &command) {
 
   int byte_send = sendto(sock_, (const char*)buf.data(), size, 0, (const struct sockaddr *) &servaddr,
             sizeof(servaddr));
-  if (byte_send < 0) {
-    if (command.cb) {
-      (*command.cb)(kStatusSendFailed, handle_, NULL);
-    }
+  if (byte_send != static_cast<int>(size)) {
+    return false;
   }
+  return true;
 }
 
 uint16_t CommandChannel::GenerateSeq() {
@@ -229,18 +309,83 @@ uint16_t CommandChannel::GenerateSeq() {
 
 Command CommandChannel::DeepCopy(const Command &cmd) {
   Command result_cmd(cmd);
-  if (result_cmd.packet.data != NULL) {
-    result_cmd.packet.data = new uint8_t[result_cmd.packet.data_len];
-    memcpy(result_cmd.packet.data, cmd.packet.data, result_cmd.packet.data_len);
+  if (cmd.packet.data != NULL && cmd.packet.data_len != 0) {
+    result_cmd.owned_data = std::make_shared<std::vector<uint8_t> >(
+        cmd.packet.data, cmd.packet.data + cmd.packet.data_len);
+    result_cmd.packet.data = result_cmd.owned_data->data();
+  } else {
+    result_cmd.packet.data = NULL;
   }
   return result_cmd;
 }
 
-void CommandChannel::OnHeartbeatAck(const CommPacket &packet) {
+void CommandChannel::OnHeartbeatAck(const HeartbeatResponse &response) {
   last_heartbeat_ = steady_clock::now();
-  if (packet.data != NULL && packet.data_len >= sizeof(HeartbeatResponse)) {
-    last_work_state_ = reinterpret_cast<HeartbeatResponse *>(packet.data)->state;
+  last_work_state_ = response.state;
+  if (mode_transition_target_ != kLidarStateUnknown &&
+      response.state == mode_transition_target_) {
+    mode_transition_deadline_ = TimePoint();
+    mode_transition_target_ = kLidarStateUnknown;
   }
+}
+
+void CommandChannel::UpdateModeTransition(const Command &command,
+                                          TimePoint now) {
+  if (command.packet.cmd_set != kCommandSetLidar ||
+      command.packet.cmd_code != kCommandIDLidarSetMode ||
+      command.packet.data == NULL || command.packet.data_len < 1) {
+    return;
+  }
+
+  const uint8_t mode = command.packet.data[0];
+  if (mode == kLidarModePowerSaving || mode == kLidarModeStandby) {
+    mode_transition_deadline_ = now + std::chrono::seconds(15);
+    mode_transition_target_ =
+        (mode == kLidarModePowerSaving) ? kLidarStatePowerSaving
+                                       : kLidarStateStandBy;
+  } else if (mode == kLidarModeNormal) {
+    mode_transition_deadline_ = TimePoint();
+    mode_transition_target_ = kLidarStateUnknown;
+  }
+}
+
+bool CommandChannel::ClaimCommandCompletion(const Command &command) {
+  if (!command.completion) {
+    return false;
+  }
+  bool expected = false;
+  return command.completion->compare_exchange_strong(expected, true);
+}
+
+void CommandChannel::CompleteCommandOnce(const Command &command,
+                                         livox_status status, void *data) {
+  if (ClaimCommandCompletion(command) && command.cb) {
+    (*command.cb)(status, command.handle, data);
+  }
+}
+
+void CommandChannel::ForgetAcceptedCommand(const Command &command) {
+  std::lock_guard<std::mutex> lock(accepted_commands_mutex_);
+  map<uint16_t, Command>::iterator ite =
+      accepted_commands_.find(command.packet.seq_num);
+  if (ite != accepted_commands_.end() &&
+      ite->second.completion == command.completion) {
+    accepted_commands_.erase(ite);
+  }
+}
+
+bool CommandChannel::IsAcceptedCommand(const Command &command) {
+  std::lock_guard<std::mutex> lock(accepted_commands_mutex_);
+  map<uint16_t, Command>::const_iterator ite =
+      accepted_commands_.find(command.packet.seq_num);
+  return ite != accepted_commands_.end() &&
+         ite->second.completion == command.completion;
+}
+
+void CommandChannel::CompleteCommand(const Command &command,
+                                     livox_status status, void *data) {
+  ForgetAcceptedCommand(command);
+  CompleteCommandOnce(command, status, data);
 }
 
 void CommandChannel::DeviceDisconnect(uint8_t handle) {
@@ -248,14 +393,25 @@ void CommandChannel::DeviceDisconnect(uint8_t handle) {
 }
 
 void CommandChannel::Send(const Command &command) {
-  LOG_INFO(" Send Command: Set {} Id {} Seq {}", (uint16_t)command.packet.cmd_set, command.packet.cmd_code, command.packet.seq_num);
-  SendInternal(command);
-  commands_[command.packet.seq_num] = make_pair(command, steady_clock::now() + std::chrono::milliseconds(command.time_out));
-  Command &cmd = commands_[command.packet.seq_num].first;
-  if (cmd.packet.data != NULL) {
-    delete[] cmd.packet.data;
-    cmd.packet.data = NULL;
-    cmd.packet.data_len = 0;
+  if (!IsAcceptedCommand(command)) {
+    return;
   }
+  LOG_INFO(" Send Command: Set {} Id {} Seq {}", (uint16_t)command.packet.cmd_set, command.packet.cmd_code, command.packet.seq_num);
+  if (!SendInternal(command)) {
+    CompleteCommand(command, kStatusSendFailed);
+    return;
+  }
+
+  const TimePoint now = steady_clock::now();
+  UpdateModeTransition(command, now);
+  if (!IsAcceptedCommand(command)) {
+    return;
+  }
+  commands_[command.packet.seq_num] = make_pair(
+      command, now + std::chrono::milliseconds(command.time_out));
+  Command &cmd = commands_[command.packet.seq_num].first;
+  cmd.owned_data.reset();
+  cmd.packet.data = NULL;
+  cmd.packet.data_len = 0;
 }
 }  // namespace livox

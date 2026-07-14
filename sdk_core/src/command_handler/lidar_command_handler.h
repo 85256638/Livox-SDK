@@ -25,6 +25,7 @@
 #ifndef LIVOX_LIDAR_COMMAND_HANDLER_H_
 #define LIVOX_LIDAR_COMMAND_HANDLER_H_
 #include <memory>
+#include <mutex>
 #include "command_handler.h"
 
 namespace livox {
@@ -45,6 +46,7 @@ class LidarCommandHandlerImpl : public CommandHandlerImpl {
     std::shared_ptr<CommandChannel> channel;
     DeviceInfo info;
   } DeviceItem;
+  std::mutex devices_mutex_;
   std::list<DeviceItem> devices_;
   std::weak_ptr<IOLoop> loop_;
 };
