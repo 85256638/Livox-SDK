@@ -44,7 +44,7 @@ class HubCommandHandlerImpl : public CommandHandlerImpl {
   bool is_valid_;
   DeviceInfo hub_info_;
   std::mutex channel_mutex_;
-  std::unique_ptr<CommandChannel> channel_;
+  std::shared_ptr<CommandChannel> channel_;
 };
 }  // namespace livox
 #endif  // LIVOX_HUB_COMMAND_HANDLER_H_

@@ -36,9 +36,7 @@ void LidarCommandHandlerImpl::Uninit() {
   }
   for (list<DeviceItem>::iterator ite = devices.begin();
        ite != devices.end(); ++ite) {
-    if (ite->channel) {
-      ite->channel->Uninit();
-    }
+    CommandChannel::Retire(loop_, ite->channel);
   }
 }
 
@@ -89,9 +87,7 @@ bool LidarCommandHandlerImpl::RemoveDevice(uint8_t handle) {
       }
     }
   }
-  if (channel) {
-    channel->Uninit();
-  }
+  CommandChannel::Retire(loop_, channel);
 
   return found;
 }

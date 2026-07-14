@@ -14,6 +14,7 @@
 - ACK 同时校验 sequence、command set 和 command id，避免迟到或错误 ACK 完成另一条命令。
 - 修复零长度协议 payload 的空指针 `memcpy` UB，以及新编译器下 `<memory>` 直接依赖缺失。
 - LiDAR command-channel 查找与移除已加同步，避免 ROS service/timer 发送和 SDK 断线移除并发访问容器。
+- command channel 从 I/O callback 内断线时，会保留到 raw delegate 已从 I/O loop 移除后再析构，避免 heartbeat timeout 路径提前释放当前仍在执行的对象。
 
 ## 心跳策略
 

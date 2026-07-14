@@ -254,6 +254,25 @@ void CommandChannel::Uninit() {
   }
 }
 
+void CommandChannel::Retire(
+    std::weak_ptr<IOLoop> loop_weak,
+    const std::shared_ptr<CommandChannel> &channel) {
+  if (!channel) {
+    return;
+  }
+
+  /** Uninit queues RemoveDelegate before the retention task below. IOLoop
+   *  executes pending tasks FIFO after the current Poll returns, so a channel
+   *  retiring from inside OnTimer/OnData remains alive until its raw delegate
+   *  has been removed. If the loop is already gone, global Uninit has joined
+   *  the I/O thread and immediate release is safe. */
+  channel->Uninit();
+  std::shared_ptr<IOLoop> loop = loop_weak.lock();
+  if (loop) {
+    loop->PostTask([channel]() {});
+  }
+}
+
 void CommandChannel::HeartBeat(TimePoint t) {
   if (heartbeat_time_ == TimePoint() || (t - heartbeat_time_) > kHeartbeatTimer) {
     heartbeat_time_ = t;

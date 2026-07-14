@@ -28,31 +28,41 @@
 namespace livox {
 
 void HubCommandHandlerImpl::Uninit() {
-  std::unique_ptr<CommandChannel> channel;
+  std::shared_ptr<CommandChannel> channel;
   {
     std::lock_guard<std::mutex> lock(channel_mutex_);
     channel = std::move(channel_);
     is_valid_ = false;
   }
-  if (channel) {
-    channel->Uninit();
-  }
+  CommandChannel::Retire(loop_, channel);
 }
 
 bool HubCommandHandlerImpl::AddDevice(const DeviceInfo &info) {
-  std::unique_ptr<CommandChannel> channel(
-      new CommandChannel(info.cmd_port, info.handle, info.ip, this));
+  std::shared_ptr<CommandChannel> channel =
+      std::make_shared<CommandChannel>(info.cmd_port, info.handle, info.ip,
+                                       this);
   if (!channel->Bind(loop_)) {
     return false;
   }
 
-  std::lock_guard<std::mutex> lock(channel_mutex_);
-  if (is_valid_) {
+  bool duplicate = false;
+  {
+    std::lock_guard<std::mutex> lock(channel_mutex_);
+    if (is_valid_) {
+      duplicate = true;
+    } else {
+      is_valid_ = true;
+      hub_info_ = info;
+      channel_ = std::move(channel);
+    }
+  }
+  if (duplicate) {
+    /** Bind has already queued AddDelegate. Retire outside channel_mutex_ so
+     *  the matching removal and lifetime retention are ordered safely and no
+     *  cancellation callback can re-enter while the container lock is held. */
+    CommandChannel::Retire(loop_, channel);
     return false;
   }
-  is_valid_ = true;
-  hub_info_ = info;
-  channel_ = std::move(channel);
   return true;
 }
 
@@ -66,15 +76,13 @@ livox_status HubCommandHandlerImpl::SendCommand(uint8_t, const Command &command)
 }
 
 bool HubCommandHandlerImpl::RemoveDevice(uint8_t) {
-  std::unique_ptr<CommandChannel> channel;
+  std::shared_ptr<CommandChannel> channel;
   {
     std::lock_guard<std::mutex> lock(channel_mutex_);
     is_valid_ = false;
     channel = std::move(channel_);
   }
-  if (channel) {
-    channel->Uninit();
-  }
+  CommandChannel::Retire(loop_, channel);
   return false;
 }
 

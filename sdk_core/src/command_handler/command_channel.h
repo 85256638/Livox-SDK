@@ -92,6 +92,11 @@ class CommandChannel : public IOLoop::IOLoopDelegate {
   /** Uninitialize CommandChannel. */
   void Uninit();
 
+  /** Detach a channel immediately, but retain its final owner until the I/O
+   *  loop has processed the queued raw-delegate removal. */
+  static void Retire(std::weak_ptr<IOLoop> loop,
+                     const std::shared_ptr<CommandChannel> &channel);
+
   /**
    * Bind a CommandChannel with a IOLoop.
    * @param loop the IOLoop to bind.
