@@ -1,82 +1,55 @@
 # Livox SDK（钛兴科技定制版）
 
-本分支基于官方 [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK) 修改，新增**状态感知心跳超时**功能，支持 LiDAR 在线工作模式切换（Normal / PowerSaving / Standby）。
+本分支基于官方 [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK)，为配套 ROS Driver 提供可靠的在线模式切换、断线取消和异步命令生命周期保证。
 
-**配套 ROS Driver**: [livox_ros_driver (updated_workingmode&set_rangefilter 分支)](https://github.com/85256638/livox_ros_driver/tree/updated_workingmode%26set_rangefilter)
+**配套 Driver**：[livox_ros_driver / `updated_workingmode&set_rangefilter`](https://github.com/85256638/livox_ros_driver/tree/updated_workingmode%26set_rangefilter)
 
----
+## 定制行为
 
-## 修改内容
+- 发送 PowerSaving / Standby 命令成功后立即开启独立 15 秒过渡宽限，不再等到设备首次报告目标状态后才延长心跳超时。
+- 稳态 Normal 仍使用 3 秒心跳超时；PowerSaving / Standby 使用 15 秒。
+- heartbeat ACK 必须包含完整 `HeartbeatResponse` 才能刷新连接和上报状态；短载荷不会被解引用。
+- 异步 API 返回 `kStatusSuccess` 后，ACK、timeout、发送失败、设备移除和 SDK `Uninit()` 中必有且仅有一次终态 callback。
+- 入队但尚未发送的命令也会在断线时以 `kStatusNotConnected` 完成；请求 payload 使用 RAII，不再因队列被丢弃而泄漏。
+- ACK 同时校验 sequence、command set 和 command id，避免迟到或错误 ACK 完成另一条命令。
+- 修复零长度协议 payload 的空指针 `memcpy` UB，以及新编译器下 `<memory>` 直接依赖缺失。
+- LiDAR command-channel 查找与移除已加同步，避免 ROS service/timer 发送和 SDK 断线移除并发访问容器。
 
-仅修改了 `sdk_core/src/command_handler/` 下的 **2 个文件**，改动量极小：
+## 心跳策略
 
-### 1. `command_channel.h`
+| 场景 | 心跳断线阈值 | 说明 |
+|---|---:|---|
+| Normal 稳态 | 3 秒 | 保持官方快速断线检测 |
+| 已处于 PowerSaving / Standby | 15 秒 | 容忍低功耗心跳间隔 |
+| mode 2/3 命令刚实际发出 | 独立 15 秒 deadline | 覆盖尚未收到目标状态的真实过渡窗口 |
 
-新增一个成员变量，记录心跳 ACK 中的设备工作状态：
+## 异步 API 契约与关闭约束
 
-```cpp
-uint8_t last_work_state_ = 0;  /**< Last known work state from heartbeat */
-```
+- API 返回非 `kStatusSuccess`：命令未被 SDK 接受，不再持有 `client_data`，也不会随后 callback。
+- API 返回 `kStatusSuccess`：调用方必须保持 `client_data` 有效，直到恰好一次终态 callback。
+- 调用全局 `Uninit()` 前必须先停止新的 SDK API 调用。
+- 不要从 SDK I/O callback 内直接调用全局 `Uninit()`；应调度到外部线程，避免线程自 `Join()`。
 
-### 2. `command_channel.cpp`
+## 获取与编译
 
-**修改 `OnHeartbeatAck()`** — 从心跳应答中提取当前工作状态：
-
-```cpp
-void CommandChannel::OnHeartbeatAck(const CommPacket &packet) {
-  last_heartbeat_ = steady_clock::now();
-  if (packet.data != NULL && packet.data_len >= sizeof(HeartbeatResponse)) {
-    last_work_state_ = reinterpret_cast<HeartbeatResponse *>(packet.data)->state;
-  }
-}
-```
-
-**修改 `OnTimer()`** — 心跳超时从固定 3 秒改为状态感知：
-
-```cpp
-auto heartbeat_timeout = std::chrono::seconds(3);
-if (last_work_state_ == 2 || last_work_state_ == 3) {
-  /** Power-saving(2) or Standby(3): use longer timeout to keep session alive */
-  heartbeat_timeout = std::chrono::seconds(15);
-}
-if (now - last_heartbeat_ > heartbeat_timeout) {
-  DeviceDisconnect(handle_);
-} else {
-  HeartBeat(now);
-}
-```
-
----
-
-## 为什么需要这个修改
-
-官方 SDK 心跳超时固定为 **3 秒**。当 LiDAR 切换工作模式时（例如 Normal → PowerSaving），固件需要时间停止电机并切换内部状态，在此过渡期间心跳响应会短暂延迟。如果延迟超过 3 秒，SDK 会误判设备断线，触发断连→重连→固件自动恢复 Normal 的循环——导致模式切换失败。
-
-本修改将 PowerSaving / Standby 状态下的心跳超时延长至 **15 秒**，确保模式过渡期间会话保持存活。Normal 模式下仍保持 3 秒超时，不影响正常断线检测。
-
-| 工作状态 | 心跳超时 | 说明 |
-|----------|---------|------|
-| Normal (1) | 3 秒 | 与官方一致，快速检测断线 |
-| PowerSaving (2) | 15 秒 | 容忍模式切换过渡期延迟 |
-| Standby (3) | 15 秒 | 同上 |
-
----
-
-## 编译安装
+不要使用官方默认分支替代本定制分支：
 
 ```bash
-cd Livox-SDK/build
-cmake ..
-make -j$(nproc)
-sudo make install
+git clone --branch 'mod_set&range_filter' --single-branch \
+  https://github.com/85256638/Livox-SDK.git
+cd Livox-SDK
+cmake -S . -B build
+cmake --build build --parallel "$(nproc)"
+sudo cmake --install build
 ```
 
-> 安装后静态库位于 `/usr/local/lib/liblivox_sdk_static.a`，ROS Driver 编译时会链接此库。
+较新 CMake 若拒绝旧 policy，可在 configure 命令增加：
 
-**注意**：如果系统 CMake 版本较新（>= 3.30），可能需要：
 ```bash
-cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+-DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ```
+
+配套 Driver 的 CMake 会固定此 fork 的精确 commit，不允许静默回退到官方 SDK 或系统中未知来源的同名库。
 
 ---
 
