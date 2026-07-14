@@ -38,7 +38,9 @@ SdkProtocol::~SdkProtocol() {}
 int32_t SdkProtocol::Pack(uint8_t *o_buf, uint32_t o_buf_size, uint32_t *o_len, const CommPacket &i_packet) {
   SdkPacket *sdk_packet = (SdkPacket *)o_buf;
 
-  if (kLidarSdk != i_packet.protocol) {
+  if (o_buf == NULL || o_len == NULL ||
+      kLidarSdk != i_packet.protocol ||
+      (i_packet.data_len != 0 && i_packet.data == NULL)) {
     return -1;
   }
 
@@ -56,7 +58,9 @@ int32_t SdkProtocol::Pack(uint8_t *o_buf, uint32_t o_buf_size, uint32_t *o_len, 
   sdk_packet->cmd_set = i_packet.cmd_set;
   sdk_packet->cmd_id = i_packet.cmd_code;
 
-  memcpy(sdk_packet->data, i_packet.data, i_packet.data_len);
+  if (i_packet.data_len != 0) {
+    memcpy(sdk_packet->data, i_packet.data, i_packet.data_len);
+  }
 
   uint32_t crc = crc32_.crc32_calc(o_buf, sdk_packet->length - kSdkPacketCrcSize);
   o_buf[sdk_packet->length - 4] = crc & 0xFF;
