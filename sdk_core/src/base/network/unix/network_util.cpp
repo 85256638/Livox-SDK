@@ -23,6 +23,7 @@
 //
 #ifndef WIN32
 #include "base/network/network_util.h"
+#include <errno.h>
 #include <ifaddrs.h>
 #include <string>
 #include <string.h>
@@ -47,7 +48,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
   if (nonblock) {
     status = ioctl(sock, FIONBIO, (char*)&on);
     if (status != 0) {
+      const int socket_error = errno;
       close(sock);
+      errno = socket_error;
       return -1;
     }
   }
@@ -56,7 +59,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
     status = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
                         (char *) &on, sizeof (on));
     if (status != 0) {
+      const int socket_error = errno;
       close(sock);
+      errno = socket_error;
       return -1;
     }
   }
@@ -70,7 +75,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
 
   status = bind(sock, (const struct sockaddr *)&servaddr, sizeof(servaddr));
   if (status != 0) {
+    const int socket_error = errno;
     close(sock);
+    errno = socket_error;
     return -1;
   }
 

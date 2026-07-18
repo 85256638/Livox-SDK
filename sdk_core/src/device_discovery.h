@@ -28,6 +28,10 @@
 #include <mutex>
 #include <string>
 #include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <tuple>
 #include "base/io_thread.h"
 #include "base/noncopyable.h"
 #include "comm/comm_port.h"
@@ -70,8 +74,19 @@ class DeviceDiscovery : public noncopyable, IOLoop::IOLoopDelegate {
   void OnData(socket_t, void *client_data);
   void OnTimer(TimePoint now);
 
+  void SetHandshakeCallback(
+      const std::function<void(const DeviceHandshakeStatus *)> &cb);
+
+  /** Queue removal of pending handshake sockets for a registered device. */
+  livox_status ResetHandshakeSession(const std::string &broadcast_code);
+
  private:
   void OnBroadcast(const CommPacket &packet, struct sockaddr *addr);
+  bool HasPendingHandshake(uint8_t handle) const;
+  uint32_t ClearPendingHandshakes(uint8_t handle, TimePoint not_after);
+  void NotifyHandshake(const DeviceInfo &info,
+                       DeviceHandshakeEvent event,
+                       int32_t detail);
 
  private:
   /** broadcast listening port number. */
@@ -82,9 +97,6 @@ class DeviceDiscovery : public noncopyable, IOLoop::IOLoopDelegate {
   static const uint16_t kDataPortOffset = 1000;
     /** sensor port number start offset. */
   static const uint16_t kSensorPortOffset = 1000;
-
-
-  static uint16_t port_count;
   socket_t sock_ = -1;
   std::weak_ptr<IOLoop> loop_;
   std::unique_ptr<CommPort> comm_port_;
@@ -92,6 +104,7 @@ class DeviceDiscovery : public noncopyable, IOLoop::IOLoopDelegate {
   typedef std::map<socket_t, std::tuple<TimePoint, DeviceInfo> > ConnectingDeviceMap;
 
   ConnectingDeviceMap connecting_devices_;
+  std::function<void(const DeviceHandshakeStatus *)> handshake_cb_;
 };
 
 DeviceDiscovery &device_discovery();

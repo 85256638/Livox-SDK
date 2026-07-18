@@ -24,6 +24,8 @@
 
 #include "device_discovery.h"
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
 #include <mutex>
 #include <iostream>
 #include <vector>
@@ -41,7 +43,17 @@ using std::chrono::steady_clock;
 
 namespace livox {
 
-uint16_t DeviceDiscovery::port_count = 0;
+namespace {
+
+int32_t LastSocketError() {
+#ifdef WIN32
+  return static_cast<int32_t>(WSAGetLastError());
+#else
+  return static_cast<int32_t>(errno);
+#endif
+}
+
+}  // namespace
 
 bool DeviceDiscovery::Init() {
   if (comm_port_ == NULL) {
@@ -63,6 +75,113 @@ bool DeviceDiscovery::Start(std::weak_ptr<IOLoop> loop) {
   return true;
 }
 
+void DeviceDiscovery::SetHandshakeCallback(
+    const std::function<void(const DeviceHandshakeStatus *)> &cb) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  handshake_cb_ = cb;
+}
+
+livox_status DeviceDiscovery::ResetHandshakeSession(
+    const std::string &broadcast_code) {
+  if (broadcast_code.empty()) {
+    return kStatusFailure;
+  }
+
+  DeviceInfo info;
+  if (!device_manager().FindDevice(broadcast_code, info)) {
+    return kStatusInvalidHandle;
+  }
+  if (device_manager().IsDeviceReady(info.handle)) {
+    return kStatusNotSupported;
+  }
+
+  std::shared_ptr<IOLoop> loop = loop_.lock();
+  if (!loop) {
+    return kStatusNotConnected;
+  }
+
+  const TimePoint requested_at = steady_clock::now();
+  loop->PostTask([this, broadcast_code, requested_at]() {
+    DeviceInfo current;
+    if (!device_manager().FindDevice(broadcast_code, current) ||
+        device_manager().IsDeviceReady(current.handle)) {
+      return;
+    }
+    const bool provisional =
+        device_manager().IsDeviceConnected(current.handle);
+    if (provisional) {
+      /** Handshake succeeded but DeviceInfo/public connect did not. */
+      DeviceReset(current.handle);
+      LOG_WARN("Cleared provisional command/data session: code {}, handle {}, ip {}",
+               broadcast_code, static_cast<uint16_t>(current.handle),
+               current.ip);
+    }
+    /** Do not cancel a fresh attempt created after this reset was requested. */
+    const uint32_t cleared =
+        ClearPendingHandshakes(current.handle, requested_at);
+    LOG_WARN("Reset local handshake session: code {}, handle {}, provisional {}, pending {}",
+             broadcast_code, static_cast<uint16_t>(current.handle),
+             provisional, cleared);
+    NotifyHandshake(current, kDeviceHandshakeReset,
+                    static_cast<int32_t>(cleared));
+  });
+  return kStatusSuccess;
+}
+
+bool DeviceDiscovery::HasPendingHandshake(uint8_t handle) const {
+  for (ConnectingDeviceMap::const_iterator ite = connecting_devices_.begin();
+       ite != connecting_devices_.end(); ++ite) {
+    if (std::get<1>(ite->second).handle == handle) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t DeviceDiscovery::ClearPendingHandshakes(uint8_t handle,
+                                                 TimePoint not_after) {
+  uint32_t cleared = 0;
+  ConnectingDeviceMap::iterator ite = connecting_devices_.begin();
+  while (ite != connecting_devices_.end()) {
+    if (std::get<1>(ite->second).handle != handle ||
+        std::get<0>(ite->second) > not_after) {
+      ++ite;
+      continue;
+    }
+    const socket_t pending_sock = ite->first;
+    if (!loop_.expired()) {
+      loop_.lock()->RemoveDelegate(pending_sock, this);
+    }
+    util::CloseSock(pending_sock);
+    connecting_devices_.erase(ite++);
+    ++cleared;
+  }
+  return cleared;
+}
+
+void DeviceDiscovery::NotifyHandshake(const DeviceInfo &info,
+                                      DeviceHandshakeEvent event,
+                                      int32_t detail) {
+  std::function<void(const DeviceHandshakeStatus *)> cb;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cb = handshake_cb_;
+  }
+  if (!cb) {
+    return;
+  }
+
+  DeviceHandshakeStatus status;
+  memset(&status, 0, sizeof(status));
+  strncpy(status.broadcast_code, info.broadcast_code,
+          sizeof(status.broadcast_code) - 1);
+  strncpy(status.ip, info.ip, sizeof(status.ip) - 1);
+  status.handle = info.handle;
+  status.event = event;
+  status.detail = detail;
+  cb(&status);
+}
+
 void DeviceDiscovery::OnData(socket_t sock, void *) {
   struct sockaddr addr;
   int addrlen = sizeof(addr);
@@ -71,6 +190,19 @@ void DeviceDiscovery::OnData(socket_t sock, void *) {
   int size = buf_size;
   size = util::RecvFrom(sock, reinterpret_cast<char *>(cache_buf), buf_size, 0, &addr, &addrlen);
   if (size < 0) {
+    ConnectingDeviceMap::iterator pending = connecting_devices_.find(sock);
+    if (pending != connecting_devices_.end()) {
+      const int32_t socket_error = LastSocketError();
+      DeviceInfo info = std::get<1>(pending->second);
+      if (!loop_.expired()) {
+        loop_.lock()->RemoveDelegate(sock, this);
+      }
+      util::CloseSock(sock);
+      connecting_devices_.erase(pending);
+      LOG_WARN("Handshake receive failed: code {}, errno {}",
+               info.broadcast_code, socket_error);
+      NotifyHandshake(info, kDeviceHandshakeNetworkError, socket_error);
+    }
     return;
   }
 
@@ -82,20 +214,27 @@ void DeviceDiscovery::OnData(socket_t sock, void *) {
     if (packet.cmd_set == kCommandSetGeneral && packet.cmd_code == kCommandIDGeneralBroadcast) {
       OnBroadcast(packet, &addr);
     } else if (packet.cmd_set == kCommandSetGeneral && packet.cmd_code == kCommandIDGeneralHandshake) {
-      if (connecting_devices_.find(sock) == connecting_devices_.end()) {
+      ConnectingDeviceMap::iterator pending = connecting_devices_.find(sock);
+      if (pending == connecting_devices_.end()) {
         continue;
       }
-      DeviceInfo info = std::get<1>(connecting_devices_[sock]);
+      DeviceInfo info = std::get<1>(pending->second);
       if (!loop_.expired()) {
         loop_.lock()->RemoveDelegate(sock, this);
       }
       util::CloseSock(sock);
-      connecting_devices_.erase(sock);
+      connecting_devices_.erase(pending);
 
-      if (packet.data == NULL) {
+      if (packet.packet_type != kCommandTypeAck || packet.data == NULL ||
+          packet.data_len < sizeof(uint8_t)) {
+        LOG_WARN("Malformed handshake ACK: code {}, packet type {}, payload {}",
+                 info.broadcast_code, static_cast<uint16_t>(packet.packet_type),
+                 packet.data_len);
+        NotifyHandshake(info, kDeviceHandshakeProtocolError, kStatusFailure);
         continue;
       }
-      if (*(uint8_t *)packet.data == 0) {
+      const uint8_t ret_code = *(uint8_t *)packet.data;
+      if (ret_code == 0) {
         LOG_INFO("New Device");
         LOG_INFO("Handle: {}", static_cast<uint16_t>(info.handle));
         LOG_INFO("Broadcast Code: {}", info.broadcast_code);
@@ -104,6 +243,12 @@ void DeviceDiscovery::OnData(socket_t sock, void *) {
         LOG_INFO("Command Port: {}", info.cmd_port);
         LOG_INFO("Data Port: {}", info.data_port);
         DeviceFound(info);
+        NotifyHandshake(info, kDeviceHandshakeSuccess, 0);
+      } else {
+        LOG_WARN("Handshake rejected: code {}, ret_code {}",
+                 info.broadcast_code, static_cast<uint16_t>(ret_code));
+        NotifyHandshake(info, kDeviceHandshakeRejected,
+                        static_cast<int32_t>(ret_code));
       }
     }
   }
@@ -114,11 +259,17 @@ void DeviceDiscovery::OnTimer(TimePoint now) {
   while (ite != connecting_devices_.end()) {
     tuple<TimePoint, DeviceInfo> &device_tuple = ite->second;
     if (now - std::get<0>(device_tuple) > std::chrono::milliseconds(500)) {
+      DeviceInfo info = std::get<1>(device_tuple);
+      const socket_t pending_sock = ite->first;
       if (!loop_.expired()) {
-        loop_.lock()->RemoveDelegate(ite->first, this);
+        loop_.lock()->RemoveDelegate(pending_sock, this);
       }
-      util::CloseSock(ite->first);
+      util::CloseSock(pending_sock);
       connecting_devices_.erase(ite++);
+      /** Driver-side diagnostics edge/periodically throttle repeated timeouts. */
+      LOG_DEBUG("Handshake timeout: code {}, handle {}", info.broadcast_code,
+                static_cast<uint16_t>(info.handle));
+      NotifyHandshake(info, kDeviceHandshakeTimeout, kStatusTimeout);
     } else {
       ++ite;
     }
@@ -134,18 +285,33 @@ void DeviceDiscovery::Uninit() {
     sock_ = -1;
   }
 
+  for (ConnectingDeviceMap::iterator ite = connecting_devices_.begin();
+       ite != connecting_devices_.end(); ++ite) {
+    util::CloseSock(ite->first);
+  }
+  connecting_devices_.clear();
+
   if (comm_port_) {
     comm_port_.reset(NULL);
   }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    handshake_cb_ = NULL;
+  }
+  loop_.reset();
 }
 
 void DeviceDiscovery::OnBroadcast(const CommPacket &packet,  struct sockaddr *addr) {
-  if (packet.data == NULL) {
+  const uint32_t broadcast_payload_size =
+      static_cast<uint32_t>(offsetof(BroadcastDeviceInfo, ip));
+  if (packet.data == NULL || packet.data_len < broadcast_payload_size) {
     return;
   }
 
   BroadcastDeviceInfo device_info;
-  memcpy((void*)(&device_info),(void*)(packet.data),(sizeof(BroadcastDeviceInfo)-sizeof(device_info.ip)));
+  memset(&device_info, 0, sizeof(device_info));
+  memcpy(&device_info, packet.data, broadcast_payload_size);
+  device_info.broadcast_code[sizeof(device_info.broadcast_code) - 1] = '\0';
   string broadcast_code = device_info.broadcast_code;
   LOG_INFO(" Broadcast broadcast code: {}", broadcast_code);
 
@@ -167,35 +333,56 @@ void DeviceDiscovery::OnBroadcast(const CommPacket &packet,  struct sockaddr *ad
     return;
   }
 
-  ++port_count;
+  OnTimer(steady_clock::now());
+  if (HasPendingHandshake(lidar_info.handle)) {
+    return;
+  }
+
+  /** Stable, per-handle ports keep retries bounded and cannot wrap after a
+   *  long broadcast-only outage. Handles are allocated in [0, 31]. */
+  const uint16_t port_slot = static_cast<uint16_t>(lidar_info.handle) + 1;
   strncpy(lidar_info.broadcast_code, broadcast_code.c_str(), sizeof(lidar_info.broadcast_code)-1);
-  lidar_info.cmd_port = kListenPort + kCmdPortOffset + port_count;
-  lidar_info.data_port = kListenPort + kDataPortOffset + port_count;
-  lidar_info.sensor_port = kListenPort + kSensorPortOffset + port_count;
+  lidar_info.broadcast_code[sizeof(lidar_info.broadcast_code) - 1] = '\0';
+  lidar_info.cmd_port = kListenPort + kCmdPortOffset + port_slot;
+  lidar_info.data_port = kListenPort + kDataPortOffset + port_slot;
+  lidar_info.sensor_port = kListenPort + kSensorPortOffset + port_slot;
   lidar_info.type = device_info.dev_type;
   lidar_info.state = kLidarStateUnknown;
   lidar_info.feature = kLidarFeatureNone;
-  lidar_info.status.progress = 0;
+  memset(&lidar_info.status, 0, sizeof(lidar_info.status));
 
   strncpy(lidar_info.ip, ip, sizeof(lidar_info.ip));
+  lidar_info.ip[sizeof(lidar_info.ip) - 1] = '\0';
 
   socket_t cmd_sock = util::CreateSocket(lidar_info.cmd_port);
   if (cmd_sock < 0) {
+    const int32_t socket_error = LastSocketError();
+    LOG_WARN("Create handshake socket failed: code {}, port {}, errno {}",
+             lidar_info.broadcast_code, lidar_info.cmd_port, socket_error);
+    NotifyHandshake(lidar_info, kDeviceHandshakeNetworkError, socket_error);
     return;
   }
-  if (!loop_.expired()) {
-    loop_.lock()->AddDelegate(cmd_sock, this);
+  std::shared_ptr<IOLoop> loop = loop_.lock();
+  if (!loop) {
+    util::CloseSock(cmd_sock);
+    NotifyHandshake(lidar_info, kDeviceHandshakeNetworkError,
+                    kStatusNotConnected);
+    return;
   }
-  OnTimer(steady_clock::now());
-  std::get<1>(connecting_devices_[cmd_sock]) = lidar_info;
+
+  connecting_devices_[cmd_sock] =
+      std::make_tuple(steady_clock::now(), lidar_info);
+  loop->AddDelegate(cmd_sock, this);
 
   bool result = false;
+  DeviceHandshakeEvent failure_event = kDeviceHandshakeNetworkError;
+  int32_t failure_detail = kStatusFailure;
   do {
     HandshakeRequest handshake_req;
     uint32_t local_ip = 0;
     if (util::FindLocalIp(*(struct sockaddr_in*)addr, local_ip) == false) {
-      result = false;
-      LOG_INFO("LocalIp and DeviceIp are not in same subnet");
+      LOG_WARN("LocalIp and DeviceIp are not in same subnet: code {}, ip {}",
+               lidar_info.broadcast_code, lidar_info.ip);
       break;
     }
     LOG_INFO("LocalIP: {}", inet_ntoa(*(struct in_addr *)&local_ip));
@@ -216,22 +403,30 @@ void DeviceDiscovery::OnBroadcast(const CommPacket &packet,  struct sockaddr *ad
     packet.data = (uint8_t *)&handshake_req;
 
     vector<uint8_t> buf(kMaxCommandBufferSize + 1);
-    int o_len = kMaxCommandBufferSize;
-    comm_port_->Pack(buf.data(), kMaxCommandBufferSize, (uint32_t *)&o_len, packet);
-    int byte_send = sendto(cmd_sock, reinterpret_cast<const char *>(buf.data()), o_len, 0, addr, sizeof(*addr));
-    if (byte_send < 0) {
-      return;
+    uint32_t o_len = 0;
+    if (comm_port_->Pack(buf.data(), kMaxCommandBufferSize, &o_len, packet) != 0 ||
+        o_len == 0) {
+      failure_event = kDeviceHandshakeProtocolError;
+      LOG_WARN("Pack handshake failed: code {}", lidar_info.broadcast_code);
+      break;
+    }
+    const int expected_size = static_cast<int>(o_len);
+    int byte_send = sendto(cmd_sock, reinterpret_cast<const char *>(buf.data()),
+                           expected_size, 0, addr, sizeof(*addr));
+    if (byte_send != expected_size) {
+      failure_detail = byte_send < 0 ? LastSocketError() : kStatusSendFailed;
+      LOG_WARN("Send handshake failed: code {}, sent {}, expected {}, errno/status {}",
+               lidar_info.broadcast_code, byte_send, expected_size,
+               failure_detail);
+      break;
     }
     std::get<0>(connecting_devices_[cmd_sock]) = steady_clock::now();
     result = true;
   } while (0);
 
   if (result == false) {
-    if (!loop_.expired()) {
-      loop_.lock()->RemoveDelegate(cmd_sock, this);
-    }
-    util::CloseSock(cmd_sock);
-    connecting_devices_.erase(cmd_sock);
+    ClearPendingHandshakes(lidar_info.handle, (TimePoint::max)());
+    NotifyHandshake(lidar_info, failure_event, failure_detail);
   }
 }
 

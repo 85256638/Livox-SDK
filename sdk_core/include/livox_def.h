@@ -99,6 +99,16 @@ typedef enum {
   kEventHubConnectionChange = 3   /**< Hub is connected or LiDAR unit(s) is/are removed. */
 } DeviceEvent;
 
+/** Handshake state reported while connecting to a directly attached device. */
+typedef enum {
+  kDeviceHandshakeSuccess = 0,       /**< The device accepted the handshake. */
+  kDeviceHandshakeTimeout = 1,       /**< No handshake response was received before the timeout. */
+  kDeviceHandshakeRejected = 2,      /**< The device returned a non-zero handshake result. */
+  kDeviceHandshakeNetworkError = 3,  /**< A local socket, route, or send operation failed. */
+  kDeviceHandshakeProtocolError = 4, /**< The handshake response was malformed. */
+  kDeviceHandshakeReset = 5          /**< Pending local handshake state was explicitly cleared. */
+} DeviceHandshakeEvent;
+
 /** Timestamp sync mode define. */
 typedef enum {
   kTimestampTypeNoSync = 0, /**< No sync signal mode. */
@@ -356,6 +366,15 @@ typedef struct {
   uint16_t reserved;                       /**< Reserved. */
   char ip[16];                             /**< Device ip. */
 } BroadcastDeviceInfo;
+
+/** Diagnostic information for a device handshake event. */
+typedef struct {
+  char broadcast_code[kBroadcastCodeSize]; /**< Device broadcast code. */
+  char ip[16];                             /**< Device IP address. */
+  uint8_t handle;                          /**< Handle assigned by AddLidarToConnect/AddHubToConnect. */
+  DeviceHandshakeEvent event;              /**< Handshake event type. */
+  int32_t detail;                          /**< Device ret_code, socket errno, or LivoxStatus depending on event. */
+} DeviceHandshakeStatus;
 
 /** The information of LiDAR units that are connected to the Livox Hub. */
 typedef struct {

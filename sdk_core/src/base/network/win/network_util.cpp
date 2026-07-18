@@ -50,7 +50,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
   if (nonblock) {
     status = ioctlsocket(sock, FIONBIO, (u_long *)&on);
     if (status != NO_ERROR) {
+      const int socket_error = WSAGetLastError();
       closesocket(sock);
+      WSASetLastError(socket_error);
       return -1;
     }
   }
@@ -59,7 +61,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
     status = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
                         (char *) &on, sizeof (on));
     if (status != 0) {
+      const int socket_error = WSAGetLastError();
       closesocket(sock);
+      WSASetLastError(socket_error);
       return -1;
     }
   }
@@ -72,7 +76,9 @@ socket_t CreateSocket(uint16_t port, bool nonblock, bool reuse_port) {
 
   status = bind(sock, (const struct sockaddr *)&servaddr, sizeof(servaddr));
   if (status != 0) {
+    const int socket_error = WSAGetLastError();
     closesocket(sock);
+    WSASetLastError(socket_error);
     return -1;
   }
 

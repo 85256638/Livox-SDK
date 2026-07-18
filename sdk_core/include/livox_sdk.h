@@ -80,6 +80,19 @@ typedef void (*DeviceBroadcastCallback)(const BroadcastDeviceInfo *info);
 void SetBroadcastCallback(DeviceBroadcastCallback cb);
 
 /**
+ * @c SetDeviceHandshakeCallback response callback function.
+ * @param status handshake diagnostic information, valid only until the callback returns.
+ */
+typedef void (*DeviceHandshakeCallback)(const DeviceHandshakeStatus *status);
+
+/**
+ * Set the callback for direct-device handshake results. The callback runs on the SDK I/O thread and should return
+ * promptly. ResetLidarHandshakeSession may safely be called from the callback because reset work is queued.
+ * @param cb callback for handshake diagnostics; NULL disables the callback.
+ */
+void SetDeviceHandshakeCallback(DeviceHandshakeCallback cb);
+
+/**
  * @c SetDeviceStateUpdateCallback response callback function.
  * @param device  information of the connected device.
  * @param type    the update type that indicates connection/disconnection of the device or change of working state.
@@ -118,6 +131,16 @@ livox_status AddHubToConnect(const char *broadcast_code, uint8_t *handle);
  * @return kStatusSuccess on successful return, see \ref LivoxStatus for other error code.
  */
 livox_status AddLidarToConnect(const char *broadcast_code, uint8_t *handle);
+
+/**
+ * Clear pending local handshake sockets for one registered LiDAR that has not completed its public connection event.
+ * A provisional command/data session awaiting DeviceInfo is also cleared. The reset is queued on the SDK I/O thread;
+ * the next broadcast from that LiDAR starts a fresh handshake. A fully connected device is never interrupted.
+ * @param broadcast_code broadcast code previously registered with AddLidarToConnect.
+ * @return kStatusSuccess if reset was queued, kStatusInvalidHandle if the code is not registered,
+ *         kStatusNotSupported if the device has completed kEventConnect, or another LivoxStatus on failure.
+ */
+livox_status ResetLidarHandshakeSession(const char *broadcast_code);
 
 /**
  * Get all connected devices' information.

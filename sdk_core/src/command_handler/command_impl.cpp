@@ -27,6 +27,7 @@
 #include "command_handler.h"
 #include "command_impl.h"
 #include "data_handler/data_handler.h"
+#include "device_discovery.h"
 #include "device_manager.h"
 #include "livox_def.h"
 #include "livox_sdk.h"
@@ -46,6 +47,10 @@ void SetBroadcastCallback(DeviceBroadcastCallback cb) {
   device_manager().SetDeviceBroadcastCallback(cb);
 }
 
+void SetDeviceHandshakeCallback(DeviceHandshakeCallback cb) {
+  device_discovery().SetHandshakeCallback(cb);
+}
+
 livox_status AddHubToConnect(const char *broadcast_code, uint8_t *handle) {
   bool result = device_manager().AddListeningDevice(broadcast_code, kDeviceModeHub, *handle);
   if (result) {
@@ -62,6 +67,13 @@ livox_status AddLidarToConnect(const char *broadcast_code, uint8_t *handle) {
   } else {
     return kStatusFailure;
   }
+}
+
+livox_status ResetLidarHandshakeSession(const char *broadcast_code) {
+  if (broadcast_code == NULL) {
+    return kStatusFailure;
+  }
+  return device_discovery().ResetHandshakeSession(broadcast_code);
 }
 
 livox_status GetConnectedDevices(DeviceInfo *devices, uint8_t *size) {

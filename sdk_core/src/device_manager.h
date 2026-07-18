@@ -89,6 +89,9 @@ class DeviceManager : public noncopyable {
    */
   bool IsDeviceConnected(uint8_t handle);
 
+  /** True after the connection has completed the information query exposed to users. */
+  bool IsDeviceReady(uint8_t handle);
+
   void SetDeviceConnectedCallback(const std::function<void(const DeviceInfo *, DeviceEvent)> &cb) {
     connected_cb_ = cb;
   }
@@ -112,8 +115,9 @@ class DeviceManager : public noncopyable {
  private:
   typedef struct _DetailDeviceInfo {
     bool connected;
+    bool ready;
     DeviceInfo info;
-    _DetailDeviceInfo() { connected = false; }
+    _DetailDeviceInfo() : connected(false), ready(false) {}
     _DetailDeviceInfo(bool _connected,
                       const char *broadcast_code,
                       uint8_t handle,
@@ -125,6 +129,7 @@ class DeviceManager : public noncopyable {
                       const char *ip,
                       const uint8_t *firmware_version) {
       connected = _connected;
+      ready = _connected;
       strncpy(info.broadcast_code, broadcast_code, sizeof(info.broadcast_code));
       info.handle = handle;
       info.slot = port;
@@ -137,6 +142,7 @@ class DeviceManager : public noncopyable {
     }
     void clear() {
       connected = false;
+      ready = false;
       memset(info.broadcast_code, 0, sizeof(info.broadcast_code));
       info.handle = 0;
       info.slot = 0;
@@ -159,6 +165,7 @@ class DeviceManager : public noncopyable {
 DeviceManager &device_manager();
 void DeviceFound(const DeviceInfo &data);
 void DeviceRemove(uint8_t handle,DeviceEvent device_event);
+void DeviceReset(uint8_t handle);
 
 }  // namespace livox
 
