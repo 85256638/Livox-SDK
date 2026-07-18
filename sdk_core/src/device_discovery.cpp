@@ -173,9 +173,11 @@ void DeviceDiscovery::NotifyHandshake(const DeviceInfo &info,
 
   DeviceHandshakeStatus status;
   memset(&status, 0, sizeof(status));
-  strncpy(status.broadcast_code, info.broadcast_code,
-          sizeof(status.broadcast_code) - 1);
-  strncpy(status.ip, info.ip, sizeof(status.ip) - 1);
+  memcpy(status.broadcast_code, info.broadcast_code,
+         sizeof(status.broadcast_code) - 1);
+  status.broadcast_code[sizeof(status.broadcast_code) - 1] = '\0';
+  memcpy(status.ip, info.ip, sizeof(status.ip) - 1);
+  status.ip[sizeof(status.ip) - 1] = '\0';
   status.handle = info.handle;
   status.event = event;
   status.detail = detail;
