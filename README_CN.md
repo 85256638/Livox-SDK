@@ -1,12 +1,11 @@
 # 定制分支说明
 
-本仓库的 `mod_set&range_filter` 分支是配套 Livox ROS Driver 使用的定制 SDK。它包含 mode 2/3 发送即生效的 15 秒过渡宽限、严格 heartbeat 载荷校验、异步命令在 ACK、超时、发送失败、断线和 `Uninit()` 路径上的 exactly-once callback/cancel 保证，以及 I/O delegate 安全移除后的延迟 channel 回收。
+本仓库的 `network-relay-added` 分支是配套同名 Livox ROS Driver 分支使用的定制 SDK。它包含 mode 2/3 发送即生效的 15 秒过渡宽限、严格 heartbeat 载荷校验、异步命令在 ACK、超时、发送失败、断线和 `Uninit()` 路径上的 exactly-once callback/cancel 保证，以及 I/O delegate 安全移除后的延迟 channel 回收。
 
 请显式获取定制分支，不要用下方官方示例中的官方 `master` 替代：
 
 ```bash
-git clone --branch 'mod_set&range_filter' --single-branch \
-  https://github.com/85256638/Livox-SDK.git
+git clone --branch 'network-relay-added' --single-branch https://github.com/85256638/Livox-SDK.git
 ```
 
 完整差异、异步 API 生命周期契约和关闭约束见 [README.md](README.md)。

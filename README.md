@@ -2,7 +2,7 @@
 
 本分支基于官方 [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK)，为配套 ROS Driver 提供可靠的在线模式切换、断线取消和异步命令生命周期保证。
 
-**配套 Driver**：[livox_ros_driver / `updated_workingmode&set_rangefilter`](https://github.com/85256638/livox_ros_driver/tree/updated_workingmode%26set_rangefilter)
+**配套 Driver**：[livox_ros_driver / `network-relay-added`](https://github.com/85256638/livox_ros_driver/tree/network-relay-added)
 
 ## 定制行为
 
@@ -36,12 +36,7 @@
 不要使用官方默认分支替代本定制分支：
 
 ```bash
-git clone --branch 'mod_set&range_filter' --single-branch \
-  https://github.com/85256638/Livox-SDK.git
-cd Livox-SDK
-cmake -S . -B build
-cmake --build build --parallel "$(nproc)"
-sudo cmake --install build
+git clone --branch 'network-relay-added' --single-branch https://github.com/85256638/Livox-SDK.git && cd Livox-SDK && cmake -S . -B build && cmake --build build --parallel "$(nproc)" && sudo cmake --install build
 ```
 
 较新 CMake 若拒绝旧 policy，可在 configure 命令增加：
